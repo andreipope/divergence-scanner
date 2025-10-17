@@ -427,9 +427,9 @@ if __name__ == "__main__":
     scanner = BybitDivergenceScanner()
     
     # Run the scanner
-    # alerts = scanner.scan()
+    alerts = scanner.scan()
     
     # Optionally, you can run this in a loop
-    while True:
-        alerts = scanner.scan()
-        time.sleep(900)  # Wait 15 minutes before next scan
+    # while True:
+    #     alerts = scanner.scan()
+    #     time.sleep(900)  # Wait 15 minutes before next scan
