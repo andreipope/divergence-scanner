@@ -11,13 +11,14 @@ import sys
 warnings.filterwarnings('ignore')
 
 # Configuration
-MIN_DAILY_VOLUME = 5000000  # $5M daily volume minimum
+MIN_DAILY_VOLUME = 2000000  # $5M daily volume minimum
 PIVOT_PERIOD = 5
 MAX_BARS_TO_CHECK = 100
 MIN_DIVERGENCES = 3  # Minimum number of REGULAR divergences required
 MAX_DIVERGENCE_AGE = 2  # Only alert on divergences confirmed within last 2 candles
 DISCORD_WEBHOOK = os.environ.get('DISCORD_WEBHOOK')
 DONT_CONFIRM = True  # New parameter matching PineScript's dontconfirm
+FILTER_CHOPPY_MARKETS = True  # Enable filtering of choppy/ranging markets
 
 # At the top of your script
 print(f"Script started at {datetime.now()}")
@@ -110,6 +111,71 @@ class TechnicalIndicators:
         
         mfi = 100 - (100 / (1 + positive_mf / negative_mf))
         return mfi
+    
+    @staticmethod
+    def adx(high, low, close, period=14):
+        """Calculate Average Directional Index - measures trend strength"""
+        plus_dm = high.diff()
+        minus_dm = -low.diff()
+        
+        plus_dm[plus_dm < 0] = 0
+        minus_dm[minus_dm < 0] = 0
+        
+        # When both are positive, select the larger one
+        mask = (plus_dm > 0) & (minus_dm > 0)
+        plus_dm[mask & (plus_dm < minus_dm)] = 0
+        minus_dm[mask & (plus_dm >= minus_dm)] = 0
+        
+        # Calculate True Range
+        tr1 = high - low
+        tr2 = abs(high - close.shift())
+        tr3 = abs(low - close.shift())
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        
+        # Smooth the values
+        atr = tr.rolling(window=period).mean()
+        plus_di = 100 * (plus_dm.rolling(window=period).mean() / atr)
+        minus_di = 100 * (minus_dm.rolling(window=period).mean() / atr)
+        
+        # Calculate DX and ADX
+        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+        adx = dx.rolling(window=period).mean()
+        
+        return adx
+    
+    @staticmethod
+    def choppiness_index(high, low, close, period=14):
+        """Calculate Choppiness Index - higher values indicate choppy market"""
+        # Calculate True Range sum
+        tr1 = high - low
+        tr2 = abs(high - close.shift())
+        tr3 = abs(low - close.shift())
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        tr_sum = tr.rolling(window=period).sum()
+        
+        # Calculate highest high and lowest low
+        hh = high.rolling(window=period).max()
+        ll = low.rolling(window=period).min()
+        
+        # Choppiness Index formula
+        ci = 100 * np.log10(tr_sum / (hh - ll)) / np.log10(period)
+        
+        return ci
+    
+    @staticmethod
+    def efficiency_ratio(close, period=20):
+        """Calculate Efficiency Ratio - measures directional movement efficiency"""
+        # Calculate net change over period
+        net_change = abs(close - close.shift(period))
+        
+        # Calculate sum of absolute changes
+        sum_changes = close.diff().abs().rolling(window=period).sum()
+        
+        # Efficiency ratio
+        er = net_change / sum_changes
+        er = er.fillna(0)
+        
+        return er
 
 class DivergenceDetector:
     """Detect divergences matching the PineScript logic"""
@@ -435,7 +501,7 @@ class BybitDivergenceScanner:
         """Calculate all indicators"""
         indicators = {}
         
-        # Calculate indicators
+        # Calculate divergence indicators
         indicators['macd'], indicators['signal'], indicators['histogram'] = self.indicators.macd(df['close'])
         indicators['rsi'] = self.indicators.rsi(df['close'])
         indicators['stoch'] = self.indicators.stochastic(df['high'], df['low'], df['close'])
@@ -446,7 +512,83 @@ class BybitDivergenceScanner:
         indicators['cmf'] = self.indicators.cmf(df['high'], df['low'], df['close'], df['volume'])
         indicators['mfi'] = self.indicators.mfi(df['high'], df['low'], df['close'], df['volume'])
         
+        # Calculate trend/choppiness indicators
+        indicators['adx'] = self.indicators.adx(df['high'], df['low'], df['close'])
+        indicators['choppiness'] = self.indicators.choppiness_index(df['high'], df['low'], df['close'])
+        indicators['efficiency_ratio'] = self.indicators.efficiency_ratio(df['close'])
+        
         return indicators
+    
+    def analyze_market_condition(self, df, indicators):
+        """Analyze if market is choppy/ranging or trending"""
+        conditions = {
+            'is_choppy': False,
+            'is_trending': False,
+            'trend_strength': 'None',
+            'reasons': []
+        }
+        
+        # Get latest values
+        adx = indicators['adx'].iloc[-1]
+        choppiness = indicators['choppiness'].iloc[-1]
+        efficiency_ratio = indicators['efficiency_ratio'].iloc[-1]
+        
+        # ADX Analysis (< 20-25 = weak/no trend, > 40 = strong trend)
+        if adx < 20:
+            conditions['reasons'].append(f"ADX very low ({adx:.1f})")
+            conditions['is_choppy'] = True
+        elif adx < 25:
+            conditions['reasons'].append(f"ADX low ({adx:.1f})")
+        elif adx > 40:
+            conditions['is_trending'] = True
+            conditions['trend_strength'] = 'Strong'
+            conditions['reasons'].append(f"ADX high ({adx:.1f})")
+        elif adx > 25:
+            conditions['is_trending'] = True
+            conditions['trend_strength'] = 'Moderate'
+        
+        # Choppiness Index (> 61.8 = choppy, < 38.2 = trending)
+        if choppiness > 61.8:
+            conditions['is_choppy'] = True
+            conditions['reasons'].append(f"High choppiness ({choppiness:.1f})")
+        elif choppiness < 38.2:
+            conditions['is_trending'] = True
+            conditions['reasons'].append(f"Low choppiness ({choppiness:.1f})")
+            
+        # Efficiency Ratio (< 0.3 = inefficient/choppy)
+        if efficiency_ratio < 0.3:
+            conditions['is_choppy'] = True
+            conditions['reasons'].append(f"Low efficiency ({efficiency_ratio:.2f})")
+        
+        # Price action analysis - check if price is ranging
+        period = 20
+        recent_highs = df['high'].iloc[-period:]
+        recent_lows = df['low'].iloc[-period:]
+        price_range = recent_highs.max() - recent_lows.min()
+        avg_range = (df['high'] - df['low']).iloc[-period:].mean()
+        
+        # If price range is less than 3x average bar range, it's likely ranging
+        if price_range < 3 * avg_range:
+            conditions['is_choppy'] = True
+            conditions['reasons'].append("Narrow price range")
+        
+        # Check for multiple touches of support/resistance
+        high_touches = sum(recent_highs > recent_highs.max() * 0.98)
+        low_touches = sum(recent_lows < recent_lows.min() * 1.02)
+        
+        if high_touches >= 3 and low_touches >= 3:
+            conditions['is_choppy'] = True
+            conditions['reasons'].append("Multiple S/R touches")
+        
+        # Final determination
+        if conditions['is_choppy'] and not conditions['is_trending']:
+            conditions['market_state'] = 'Choppy/Ranging'
+        elif conditions['is_trending'] and not conditions['is_choppy']:
+            conditions['market_state'] = 'Trending'
+        else:
+            conditions['market_state'] = 'Mixed/Unclear'
+            
+        return conditions
     
     def detect_divergences(self, df, indicators):
         """Detect all divergences for all indicators"""
@@ -548,6 +690,7 @@ class BybitDivergenceScanner:
         print(f"\n🔍 Starting Bybit Recent Divergence Scanner - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Min Volume: ${MIN_DAILY_VOLUME:,.0f} | Min Regular Divergences: {MIN_DIVERGENCES}")
         print(f"Max Age: {MAX_DIVERGENCE_AGE} candles | Don't Confirm Mode: {'ON' if DONT_CONFIRM else 'OFF'}")
+        print(f"Choppy Market Filter: {'ON' if FILTER_CHOPPY_MARKETS else 'OFF'}")
         print("=" * 80)
         
         # Get perpetual pairs with volume filter
@@ -571,6 +714,9 @@ class BybitDivergenceScanner:
             # Calculate indicators
             indicators = self.calculate_all_indicators(df)
             
+            # Analyze market condition
+            market_condition = self.analyze_market_condition(df, indicators)
+            
             # Detect divergences
             divergences = self.detect_divergences(df, indicators)
             
@@ -589,7 +735,10 @@ class BybitDivergenceScanner:
             # Only process if we have recent divergences (confirmed within last 2 candles)
             has_recent_divergence = 'confirmation_info' in divergences
             
-            if total_divs >= MIN_DIVERGENCES and has_recent_divergence: # and has_rsi and has_obv 
+            # Check if market is suitable for divergence trading
+            skip_due_to_choppiness = FILTER_CHOPPY_MARKETS and market_condition['is_choppy'] and not market_condition['is_trending']
+            
+            if total_divs >= MIN_DIVERGENCES and has_recent_divergence and not skip_due_to_choppiness: # and has_rsi and has_obv
                 print(f" ✅ ALERT! {total_divs} divergences found (confirmed {divergences['confirmation_info']['bars_ago']} bars ago)!")
                 
                 alert_data = {
@@ -599,6 +748,8 @@ class BybitDivergenceScanner:
                     'divergences': divergences,
                     'current_price': df['close'].iloc[-1],
                     'rsi': indicators['rsi'].iloc[-1],
+                    'adx': indicators['adx'].iloc[-1],
+                    'market_condition': market_condition,
                     'timestamp': datetime.now(),
                     'confirmation_bars_ago': divergences['confirmation_info']['bars_ago']
                 }
@@ -607,7 +758,8 @@ class BybitDivergenceScanner:
                 # Print detailed info
                 print(f"\n  📊 {symbol}")
                 print(f"  💰 Price: ${alert_data['current_price']:.4f}")
-                print(f"  📈 RSI: {alert_data['rsi']:.2f}")
+                print(f"  📈 RSI: {alert_data['rsi']:.2f} | ADX: {alert_data['adx']:.1f}")
+                print(f"  🎯 Market: {market_condition['market_state']}")
                 print(f"  🔄 Total Divergences: {total_divs} (confirmed {divergences['confirmation_info']['bars_ago']} bars ago)")
                 
                 for div_type, ind_list in divergences.items():
@@ -616,7 +768,9 @@ class BybitDivergenceScanner:
                         print(f"  • {div_type_formatted}: {', '.join(ind_list)}")
             else:
                 print(f" · {total_divs} divs", end='')
-                if total_divs > 0 and not has_recent_divergence:
+                if total_divs > 0 and skip_due_to_choppiness:
+                    print(f" (choppy market)", end='')
+                elif total_divs > 0 and not has_recent_divergence:
                     print(f" (too old)", end='')
                 elif total_divs > 0 and (not has_rsi or not has_obv):
                     print(f" (missing {'RSI' if not has_rsi else ''}{' & ' if not has_rsi and not has_obv else ''}{'OBV' if not has_obv else ''})", end='')
@@ -634,7 +788,7 @@ class BybitDivergenceScanner:
             # Option 1: Send all alerts (will be split automatically if too long)
             discord_message = f"**🔥 RECENT DIVERGENCE ALERTS - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 🔥**\n\n"
             discord_message += f"*Found {len(alerts)} symbols with divergences confirmed in last 2 candles*\n"
-            discord_message += f"*Mode: {'Early Detection' if DONT_CONFIRM else 'Confirmed'}*\n\n"
+            discord_message += f"*Mode: {'Early Detection' if DONT_CONFIRM else 'Confirmed'} | Choppy Filter: {'ON' if FILTER_CHOPPY_MARKETS else 'OFF'}*\n\n"
             
             for alert in alerts_sorted:
                 # Determine divergence type
@@ -652,9 +806,13 @@ class BybitDivergenceScanner:
                 bars_ago = alert.get('confirmation_bars_ago', 0)
                 recency = "📍 JUST NOW" if bars_ago == 0 else f"📍 {bars_ago} bar{'s' if bars_ago > 1 else ''} ago"
                 
-                discord_message += f"**{alert['symbol']}** - {div_type} {recency} | ${alert['current_price']:.4f} | RSI: {alert['rsi']:.0f}\n"
+                # Market condition emoji
+                market_emoji = "📊" if alert['market_condition']['market_state'] == 'Trending' else "⚠️"
+                
+                discord_message += f"**{alert['symbol']}** - {div_type} {recency} | ${alert['current_price']:.4f} | RSI: {alert['rsi']:.0f} | ADX: {alert['adx']:.0f} {market_emoji}\n"
             
-            discord_message += f"\n```Requirements: ≥{MIN_DIVERGENCES} regular divergences in last 2 candles```"
+            discord_message += f"\n```Requirements: ≥{MIN_DIVERGENCES} regular divergences with RSI & OBV confirmed in last 2 candles```"
+            discord_message += f"\n📊 = Trending | ⚠️ = Mixed/Unclear market conditions"
             
             self.send_discord_alert(discord_message)
             
@@ -682,7 +840,7 @@ class BybitDivergenceScanner:
             if len(alerts) > 10:
                 discord_message += f"\n*... and {len(alerts) - 10} more symbols with divergences*\n"
             
-            discord_message += f"\n```Requirements met: ≥{MIN_DIVERGENCES} divergences```"
+            discord_message += f"\n```Requirements met: ≥{MIN_DIVERGENCES} divergences with RSI & OBV```"
             
             self.send_discord_alert(discord_message)
             """
