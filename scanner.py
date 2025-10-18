@@ -14,8 +14,10 @@ warnings.filterwarnings('ignore')
 MIN_DAILY_VOLUME = 5000000  # $5M daily volume minimum
 PIVOT_PERIOD = 5
 MAX_BARS_TO_CHECK = 100
-MIN_DIVERGENCES = 4
+MIN_DIVERGENCES = 3  # Minimum number of REGULAR divergences required
+MAX_DIVERGENCE_AGE = 2  # Only alert on divergences confirmed within last 2 candles
 DISCORD_WEBHOOK = os.environ.get('DISCORD_WEBHOOK')
+DONT_CONFIRM = True  # New parameter matching PineScript's dontconfirm
 
 # At the top of your script
 print(f"Script started at {datetime.now()}")
@@ -112,111 +114,280 @@ class TechnicalIndicators:
 class DivergenceDetector:
     """Detect divergences matching the PineScript logic"""
     
-    def __init__(self, df, pivot_period=5, max_bars=100):
+    def __init__(self, df, pivot_period=5, max_bars=100, max_pivot_points=10, dont_confirm=True):
         self.df = df
         self.pivot_period = pivot_period
         self.max_bars = max_bars
+        self.max_pivot_points = max_pivot_points
+        self.dont_confirm = dont_confirm
         
-    def find_pivot_highs(self):
-        """Find pivot high points"""
+    def find_pivot_highs_realtime(self):
+        """Find pivot high points with real-time detection like PineScript"""
         highs = self.df['high'].values
         pivot_highs = []
         
+        # We can identify a pivot high once we have pivot_period bars after it
+        # This matches PineScript's behavior
         for i in range(self.pivot_period, len(highs) - self.pivot_period):
-            if all(highs[i] > highs[i-j] for j in range(1, self.pivot_period + 1)) and \
-               all(highs[i] > highs[i+j] for j in range(1, self.pivot_period + 1)):
-                pivot_highs.append(i)
+            # Check left side
+            if all(highs[i] > highs[i-j] for j in range(1, self.pivot_period + 1)):
+                # Check right side
+                if all(highs[i] > highs[i+j] for j in range(1, self.pivot_period + 1)):
+                    pivot_highs.append(i)
         
-        return pivot_highs
+        # Check if we might have a developing pivot at the end
+        # This allows detection similar to PineScript's real-time behavior
+        if self.dont_confirm and len(highs) > self.pivot_period:
+            # Check positions where we have enough left side but not full right side
+            for i in range(max(self.pivot_period, len(highs) - self.pivot_period), len(highs)):
+                if i >= len(highs):
+                    break
+                # Need at least pivot_period bars on the left
+                if i >= self.pivot_period:
+                    # Check left side
+                    if all(highs[i] > highs[i-j] for j in range(1, min(self.pivot_period + 1, i + 1))):
+                        # Check available right side
+                        right_bars = len(highs) - i - 1
+                        if right_bars > 0:
+                            if all(highs[i] > highs[i+j] for j in range(1, min(right_bars + 1, self.pivot_period + 1))):
+                                # Potential pivot, but need to verify it's not already in our list
+                                if i not in pivot_highs:
+                                    pivot_highs.append(i)
+        
+        return sorted(pivot_highs, reverse=True)  # Most recent first
     
-    def find_pivot_lows(self):
-        """Find pivot low points"""
+    def find_pivot_lows_realtime(self):
+        """Find pivot low points with real-time detection like PineScript"""
         lows = self.df['low'].values
         pivot_lows = []
         
+        # Standard pivot detection
         for i in range(self.pivot_period, len(lows) - self.pivot_period):
-            if all(lows[i] < lows[i-j] for j in range(1, self.pivot_period + 1)) and \
-               all(lows[i] < lows[i+j] for j in range(1, self.pivot_period + 1)):
-                pivot_lows.append(i)
+            if all(lows[i] < lows[i-j] for j in range(1, self.pivot_period + 1)):
+                if all(lows[i] < lows[i+j] for j in range(1, self.pivot_period + 1)):
+                    pivot_lows.append(i)
         
-        return pivot_lows
+        # Check developing pivots at the end
+        if self.dont_confirm and len(lows) > self.pivot_period:
+            for i in range(max(self.pivot_period, len(lows) - self.pivot_period), len(lows)):
+                if i >= len(lows):
+                    break
+                if i >= self.pivot_period:
+                    if all(lows[i] < lows[i-j] for j in range(1, min(self.pivot_period + 1, i + 1))):
+                        right_bars = len(lows) - i - 1
+                        if right_bars > 0:
+                            if all(lows[i] < lows[i+j] for j in range(1, min(right_bars + 1, self.pivot_period + 1))):
+                                if i not in pivot_lows:
+                                    pivot_lows.append(i)
+        
+        return sorted(pivot_lows, reverse=True)  # Most recent first
+    
+    def validate_divergence_line(self, indicator, start_idx, end_idx, price_start, price_end, is_bullish):
+        """Validate that intermediate values don't break the divergence pattern"""
+        if end_idx - start_idx <= 5:  # Minimum distance check
+            return False
+            
+        # Calculate slopes for virtual lines
+        indicator_slope = (indicator.iloc[end_idx] - indicator.iloc[start_idx]) / (end_idx - start_idx)
+        price_slope = (price_end - price_start) / (end_idx - start_idx)
+        
+        # Check all intermediate points
+        for i in range(start_idx + 1, end_idx):
+            # Calculate expected values on the virtual lines
+            indicator_line_value = indicator.iloc[start_idx] + indicator_slope * (i - start_idx)
+            price_line_value = price_start + price_slope * (i - start_idx)
+            
+            if is_bullish:
+                # For bullish divergence, indicator and price should not go below their respective lines
+                if indicator.iloc[i] < indicator_line_value or self.df['low'].iloc[i] < price_line_value:
+                    return False
+            else:
+                # For bearish divergence, indicator and price should not go above their respective lines
+                if indicator.iloc[i] > indicator_line_value or self.df['high'].iloc[i] > price_line_value:
+                    return False
+                    
+        return True
     
     def check_positive_regular_divergence(self, indicator, pivot_lows):
-        """Check for positive regular divergence (bullish)"""
+        """Check for positive regular divergence (bullish) - matching Pine Script logic"""
         if len(pivot_lows) < 2:
-            return False
-            
-        # Get the last two pivot lows within max_bars
-        recent_pivots = [p for p in pivot_lows if len(self.df) - p <= self.max_bars]
-        if len(recent_pivots) < 2:
-            return False
-            
-        curr_idx = recent_pivots[-1]
-        prev_idx = recent_pivots[-2]
+            return False, -1
         
-        # Price makes lower low, indicator makes higher low
-        if self.df['low'].iloc[curr_idx] < self.df['low'].iloc[prev_idx] and \
-           indicator.iloc[curr_idx] > indicator.iloc[prev_idx]:
-            return True
+        current_bar = len(self.df) - 1
+        startpoint = 0 if self.dont_confirm else 1
         
-        return False
+        # If dont_confirm is True and indicators/price are not confirming, check from current bar
+        if not self.dont_confirm:
+            if not (indicator.iloc[-1] > indicator.iloc[-2] or self.df['close'].iloc[-1] > self.df['close'].iloc[-2]):
+                return False, -1
+        
+        # Search through multiple pivot points (not just last 2)
+        for i in range(min(self.max_pivot_points, len(pivot_lows))):
+            curr_pivot_idx = pivot_lows[i]
+            
+            # Skip if pivot is too far from current bar
+            if current_bar - curr_pivot_idx > self.max_bars:
+                break
+                
+            # Check against previous pivots
+            for j in range(i + 1, min(i + self.max_pivot_points, len(pivot_lows))):
+                prev_pivot_idx = pivot_lows[j]
+                
+                # Skip if distance is less than minimum
+                if curr_pivot_idx - prev_pivot_idx <= 5:
+                    continue
+                
+                # For recent divergences, we might check against current bar
+                check_idx = current_bar - startpoint if current_bar - curr_pivot_idx < self.pivot_period else curr_pivot_idx
+                
+                # Check divergence condition: price lower low, indicator higher low
+                price_condition = self.df['low'].iloc[check_idx] < self.df['low'].iloc[prev_pivot_idx]
+                indicator_condition = indicator.iloc[check_idx] > indicator.iloc[prev_pivot_idx]
+                
+                if price_condition and indicator_condition:
+                    # Validate intermediate values
+                    if self.validate_divergence_line(
+                        indicator, 
+                        prev_pivot_idx, 
+                        check_idx,
+                        self.df['low'].iloc[prev_pivot_idx],
+                        self.df['low'].iloc[check_idx],
+                        is_bullish=True
+                    ):
+                        # Return True and the bar index where divergence was confirmed
+                        return True, check_idx
+                        
+        return False, -1
     
     def check_negative_regular_divergence(self, indicator, pivot_highs):
-        """Check for negative regular divergence (bearish)"""
+        """Check for negative regular divergence (bearish) - matching Pine Script logic"""
         if len(pivot_highs) < 2:
-            return False
-            
-        # Get the last two pivot highs within max_bars
-        recent_pivots = [p for p in pivot_highs if len(self.df) - p <= self.max_bars]
-        if len(recent_pivots) < 2:
-            return False
-            
-        curr_idx = recent_pivots[-1]
-        prev_idx = recent_pivots[-2]
+            return False, -1
         
-        # Price makes higher high, indicator makes lower high
-        if self.df['high'].iloc[curr_idx] > self.df['high'].iloc[prev_idx] and \
-           indicator.iloc[curr_idx] < indicator.iloc[prev_idx]:
-            return True
+        current_bar = len(self.df) - 1
+        startpoint = 0 if self.dont_confirm else 1
         
-        return False
+        # If dont_confirm is False, check confirmation
+        if not self.dont_confirm:
+            if not (indicator.iloc[-1] < indicator.iloc[-2] or self.df['close'].iloc[-1] < self.df['close'].iloc[-2]):
+                return False, -1
+        
+        for i in range(min(self.max_pivot_points, len(pivot_highs))):
+            curr_pivot_idx = pivot_highs[i]
+            
+            if current_bar - curr_pivot_idx > self.max_bars:
+                break
+                
+            for j in range(i + 1, min(i + self.max_pivot_points, len(pivot_highs))):
+                prev_pivot_idx = pivot_highs[j]
+                
+                if curr_pivot_idx - prev_pivot_idx <= 5:
+                    continue
+                
+                check_idx = current_bar - startpoint if current_bar - curr_pivot_idx < self.pivot_period else curr_pivot_idx
+                
+                # Check divergence condition: price higher high, indicator lower high
+                price_condition = self.df['high'].iloc[check_idx] > self.df['high'].iloc[prev_pivot_idx]
+                indicator_condition = indicator.iloc[check_idx] < indicator.iloc[prev_pivot_idx]
+                
+                if price_condition and indicator_condition:
+                    if self.validate_divergence_line(
+                        indicator,
+                        prev_pivot_idx,
+                        check_idx,
+                        self.df['high'].iloc[prev_pivot_idx],
+                        self.df['high'].iloc[check_idx],
+                        is_bullish=False
+                    ):
+                        # Return True and the bar index where divergence was confirmed
+                        return True, check_idx
+                        
+        return False, -1
     
     def check_positive_hidden_divergence(self, indicator, pivot_lows):
-        """Check for positive hidden divergence (bullish continuation)"""
+        """Check for positive hidden divergence (bullish continuation) - matching Pine Script logic"""
         if len(pivot_lows) < 2:
             return False
-            
-        recent_pivots = [p for p in pivot_lows if len(self.df) - p <= self.max_bars]
-        if len(recent_pivots) < 2:
-            return False
-            
-        curr_idx = recent_pivots[-1]
-        prev_idx = recent_pivots[-2]
         
-        # Price makes higher low, indicator makes lower low
-        if self.df['low'].iloc[curr_idx] > self.df['low'].iloc[prev_idx] and \
-           indicator.iloc[curr_idx] < indicator.iloc[prev_idx]:
-            return True
+        current_bar = len(self.df) - 1
+        startpoint = 0 if self.dont_confirm else 1
         
+        if not self.dont_confirm:
+            if not (indicator.iloc[-1] > indicator.iloc[-2] or self.df['close'].iloc[-1] > self.df['close'].iloc[-2]):
+                return False
+        
+        for i in range(min(self.max_pivot_points, len(pivot_lows))):
+            curr_pivot_idx = pivot_lows[i]
+            
+            if current_bar - curr_pivot_idx > self.max_bars:
+                break
+                
+            for j in range(i + 1, min(i + self.max_pivot_points, len(pivot_lows))):
+                prev_pivot_idx = pivot_lows[j]
+                
+                if curr_pivot_idx - prev_pivot_idx <= 5:
+                    continue
+                
+                check_idx = current_bar - startpoint if current_bar - curr_pivot_idx < self.pivot_period else curr_pivot_idx
+                
+                # Check divergence condition: price higher low, indicator lower low
+                price_condition = self.df['low'].iloc[check_idx] > self.df['low'].iloc[prev_pivot_idx]
+                indicator_condition = indicator.iloc[check_idx] < indicator.iloc[prev_pivot_idx]
+                
+                if price_condition and indicator_condition:
+                    if self.validate_divergence_line(
+                        indicator,
+                        prev_pivot_idx,
+                        check_idx,
+                        self.df['low'].iloc[prev_pivot_idx],
+                        self.df['low'].iloc[check_idx],
+                        is_bullish=True
+                    ):
+                        return True
+                        
         return False
     
     def check_negative_hidden_divergence(self, indicator, pivot_highs):
-        """Check for negative hidden divergence (bearish continuation)"""
+        """Check for negative hidden divergence (bearish continuation) - matching Pine Script logic"""
         if len(pivot_highs) < 2:
             return False
-            
-        recent_pivots = [p for p in pivot_highs if len(self.df) - p <= self.max_bars]
-        if len(recent_pivots) < 2:
-            return False
-            
-        curr_idx = recent_pivots[-1]
-        prev_idx = recent_pivots[-2]
         
-        # Price makes lower high, indicator makes higher high
-        if self.df['high'].iloc[curr_idx] < self.df['high'].iloc[prev_idx] and \
-           indicator.iloc[curr_idx] > indicator.iloc[prev_idx]:
-            return True
+        current_bar = len(self.df) - 1
+        startpoint = 0 if self.dont_confirm else 1
         
+        if not self.dont_confirm:
+            if not (indicator.iloc[-1] < indicator.iloc[-2] or self.df['close'].iloc[-1] < self.df['close'].iloc[-2]):
+                return False
+        
+        for i in range(min(self.max_pivot_points, len(pivot_highs))):
+            curr_pivot_idx = pivot_highs[i]
+            
+            if current_bar - curr_pivot_idx > self.max_bars:
+                break
+                
+            for j in range(i + 1, min(i + self.max_pivot_points, len(pivot_highs))):
+                prev_pivot_idx = pivot_highs[j]
+                
+                if curr_pivot_idx - prev_pivot_idx <= 5:
+                    continue
+                
+                check_idx = current_bar - startpoint if current_bar - curr_pivot_idx < self.pivot_period else curr_pivot_idx
+                
+                # Check divergence condition: price lower high, indicator higher high
+                price_condition = self.df['high'].iloc[check_idx] < self.df['high'].iloc[prev_pivot_idx]
+                indicator_condition = indicator.iloc[check_idx] > indicator.iloc[prev_pivot_idx]
+                
+                if price_condition and indicator_condition:
+                    if self.validate_divergence_line(
+                        indicator,
+                        prev_pivot_idx,
+                        check_idx,
+                        self.df['high'].iloc[prev_pivot_idx],
+                        self.df['high'].iloc[check_idx],
+                        is_bullish=False
+                    ):
+                        return True
+                        
         return False
 
 class BybitDivergenceScanner:
@@ -249,7 +420,7 @@ class BybitDivergenceScanner:
             print(f"Error fetching markets: {e}")
             return []
     
-    def fetch_ohlcv(self, symbol, timeframe='15m', limit=200):
+    def fetch_ohlcv(self, symbol, timeframe='15m', limit=500):  # Increased from 200 to 500
         """Fetch OHLCV data"""
         try:
             ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
@@ -279,17 +450,22 @@ class BybitDivergenceScanner:
     
     def detect_divergences(self, df, indicators):
         """Detect all divergences for all indicators"""
-        detector = DivergenceDetector(df, PIVOT_PERIOD, MAX_BARS_TO_CHECK)
+        detector = DivergenceDetector(df, PIVOT_PERIOD, MAX_BARS_TO_CHECK, 
+                                      max_pivot_points=10, dont_confirm=DONT_CONFIRM)
         
-        pivot_highs = detector.find_pivot_highs()
-        pivot_lows = detector.find_pivot_lows()
+        pivot_highs = detector.find_pivot_highs_realtime()
+        pivot_lows = detector.find_pivot_lows_realtime()
+        
+        current_bar = len(df) - 1
+        max_age = MAX_DIVERGENCE_AGE  # Only consider divergences confirmed within this many candles
         
         divergences = {
             'positive_regular': [],
-            'negative_regular': [],
-            'positive_hidden': [],
-            'negative_hidden': []
+            'negative_regular': []
         }
+        
+        # Track the most recent confirmation bar for any divergence
+        most_recent_confirmation = -1
         
         indicator_names = ['macd', 'histogram', 'rsi', 'stoch', 'cci', 'momentum', 'obv', 'vwmacd', 'cmf', 'mfi']
         
@@ -297,37 +473,81 @@ class BybitDivergenceScanner:
             if ind_name in indicators:
                 indicator = indicators[ind_name]
                 
-                if detector.check_positive_regular_divergence(indicator, pivot_lows):
+                # Check positive regular divergence
+                has_div, confirmation_bar = detector.check_positive_regular_divergence(indicator, pivot_lows)
+                if has_div and (current_bar - confirmation_bar) <= max_age:
                     divergences['positive_regular'].append(ind_name)
+                    most_recent_confirmation = max(most_recent_confirmation, confirmation_bar)
                     
-                if detector.check_negative_regular_divergence(indicator, pivot_highs):
+                # Check negative regular divergence
+                has_div, confirmation_bar = detector.check_negative_regular_divergence(indicator, pivot_highs)
+                if has_div and (current_bar - confirmation_bar) <= max_age:
                     divergences['negative_regular'].append(ind_name)
-                    
-                if detector.check_positive_hidden_divergence(indicator, pivot_lows):
-                    divergences['positive_hidden'].append(ind_name)
-                    
-                if detector.check_negative_hidden_divergence(indicator, pivot_highs):
-                    divergences['negative_hidden'].append(ind_name)
+                    most_recent_confirmation = max(most_recent_confirmation, confirmation_bar)
+        
+        # Add information about when the divergence was confirmed
+        if most_recent_confirmation > -1:
+            bars_ago = current_bar - most_recent_confirmation
+            divergences['confirmation_info'] = {
+                'bars_ago': bars_ago,
+                'timestamp': df['timestamp'].iloc[most_recent_confirmation]
+            }
         
         return divergences
     
     def send_discord_alert(self, message):
-        """Send alert to Discord"""
+        """Send alert to Discord with automatic message splitting for long content"""
         try:
-            data = {
-                "content": message,
-                "username": "Divergence Scanner"
-            }
-            response = requests.post(DISCORD_WEBHOOK, json=data)
-            if response.status_code != 204:
-                print(f"Discord webhook error: {response.status_code}")
+            # Discord has a 2000 character limit
+            max_length = 1900  # Leave some buffer
+            
+            if len(message) <= max_length:
+                # Message fits in one post
+                data = {
+                    "content": message,
+                    "username": "Divergence Scanner"
+                }
+                response = requests.post(self.discord_webhook, json=data)
+                if response.status_code != 204:
+                    print(f"Discord webhook error: {response.status_code}")
+            else:
+                # Split message into multiple parts
+                parts = []
+                current_part = ""
+                lines = message.split('\n')
+                
+                for line in lines:
+                    # If adding this line would exceed limit, start a new part
+                    if len(current_part) + len(line) + 1 > max_length:
+                        if current_part:
+                            parts.append(current_part)
+                        current_part = line + '\n'
+                    else:
+                        current_part += line + '\n'
+                
+                # Don't forget the last part
+                if current_part:
+                    parts.append(current_part)
+                
+                # Send each part
+                for i, part in enumerate(parts):
+                    data = {
+                        "content": part,
+                        "username": f"Divergence Scanner ({i+1}/{len(parts)})"
+                    }
+                    response = requests.post(self.discord_webhook, json=data)
+                    if response.status_code != 204:
+                        print(f"Discord webhook error on part {i+1}: {response.status_code}")
+                    time.sleep(0.5)  # Small delay between messages to avoid rate limiting
+                    
         except Exception as e:
             print(f"Error sending Discord alert: {e}")
     
     def scan(self):
         """Main scanning function"""
-        print(f"\n🔍 Starting Bybit Divergence Scanner - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"Min Volume: ${MIN_DAILY_VOLUME:,.0f} | Min Divergences: {MIN_DIVERGENCES}")
+        print(f"\n🔍 Starting Bybit Recent Divergence Scanner - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Min Volume: ${MIN_DAILY_VOLUME:,.0f} | Min Regular Divergences: {MIN_DIVERGENCES}")
+        print(f"Max Age: {MAX_DIVERGENCE_AGE} candles | Don't Confirm Mode: {'ON' if DONT_CONFIRM else 'OFF'}")
         print("=" * 80)
         
         # Get perpetual pairs with volume filter
@@ -344,7 +564,7 @@ class BybitDivergenceScanner:
             
             # Fetch OHLCV data
             df = self.fetch_ohlcv(symbol)
-            if df is None or len(df) < 100:
+            if df is None or len(df) < 200:
                 print(" ❌ Insufficient data")
                 continue
             
@@ -355,18 +575,22 @@ class BybitDivergenceScanner:
             divergences = self.detect_divergences(df, indicators)
             
             # Count total divergences
-            total_divs = sum(len(divs) for divs in divergences.values())
+            total_divs = sum(len(divs) for divs_type, divs in divergences.items() if divs_type != 'confirmation_info')
             
             # Check if RSI and OBV are included
             all_divergence_indicators = []
             for div_type, indicators_list in divergences.items():
-                all_divergence_indicators.extend(indicators_list)
+                if div_type != 'confirmation_info':
+                    all_divergence_indicators.extend(indicators_list)
             
             has_rsi = 'rsi' in all_divergence_indicators
             has_obv = 'obv' in all_divergence_indicators
             
-            if total_divs >= MIN_DIVERGENCES and has_rsi and has_obv:
-                print(f" ✅ ALERT! {total_divs} divergences found!")
+            # Only process if we have recent divergences (confirmed within last 2 candles)
+            has_recent_divergence = 'confirmation_info' in divergences
+            
+            if total_divs >= MIN_DIVERGENCES and has_recent_divergence: # and has_rsi and has_obv 
+                print(f" ✅ ALERT! {total_divs} divergences found (confirmed {divergences['confirmation_info']['bars_ago']} bars ago)!")
                 
                 alert_data = {
                     'symbol': symbol,
@@ -375,7 +599,8 @@ class BybitDivergenceScanner:
                     'divergences': divergences,
                     'current_price': df['close'].iloc[-1],
                     'rsi': indicators['rsi'].iloc[-1],
-                    'timestamp': datetime.now()
+                    'timestamp': datetime.now(),
+                    'confirmation_bars_ago': divergences['confirmation_info']['bars_ago']
                 }
                 alerts.append(alert_data)
                 
@@ -383,14 +608,17 @@ class BybitDivergenceScanner:
                 print(f"\n  📊 {symbol}")
                 print(f"  💰 Price: ${alert_data['current_price']:.4f}")
                 print(f"  📈 RSI: {alert_data['rsi']:.2f}")
-                print(f"  🔄 Total Divergences: {total_divs}")
+                print(f"  🔄 Total Divergences: {total_divs} (confirmed {divergences['confirmation_info']['bars_ago']} bars ago)")
                 
                 for div_type, ind_list in divergences.items():
-                    if ind_list:
-                        print(f"  • {div_type.replace('_', ' ').title()}: {', '.join(ind_list)}")
+                    if ind_list and div_type != 'confirmation_info':
+                        div_type_formatted = "Bullish" if div_type == "positive_regular" else "Bearish"
+                        print(f"  • {div_type_formatted}: {', '.join(ind_list)}")
             else:
                 print(f" · {total_divs} divs", end='')
-                if total_divs > 0 and (not has_rsi or not has_obv):
+                if total_divs > 0 and not has_recent_divergence:
+                    print(f" (too old)", end='')
+                elif total_divs > 0 and (not has_rsi or not has_obv):
                     print(f" (missing {'RSI' if not has_rsi else ''}{' & ' if not has_rsi and not has_obv else ''}{'OBV' if not has_obv else ''})", end='')
             
             # Rate limiting
@@ -398,11 +626,48 @@ class BybitDivergenceScanner:
         
         # Send Discord alerts
         if alerts:
-            print(f"\n\n🚨 SENDING {len(alerts)} ALERTS TO DISCORD 🚨")
+            print(f"\n\n🚨 FOUND {len(alerts)} ALERTS 🚨")
             
-            discord_message = f"**🔥 DIVERGENCE ALERTS - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 🔥**\n\n"
+            # Sort alerts by total divergences (descending) to prioritize strongest signals
+            alerts_sorted = sorted(alerts, key=lambda x: x['total_divergences'], reverse=True)
             
-            for alert in alerts:
+            # Option 1: Send all alerts (will be split automatically if too long)
+            discord_message = f"**🔥 RECENT DIVERGENCE ALERTS - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 🔥**\n\n"
+            discord_message += f"*Found {len(alerts)} symbols with divergences confirmed in last 2 candles*\n"
+            discord_message += f"*Mode: {'Early Detection' if DONT_CONFIRM else 'Confirmed'}*\n\n"
+            
+            for alert in alerts_sorted:
+                # Determine divergence type
+                bullish_count = len(alert['divergences'].get('positive_regular', []))
+                bearish_count = len(alert['divergences'].get('negative_regular', []))
+                div_type = ""
+                if bullish_count > 0 and bearish_count > 0:
+                    div_type = f"🔄 Mixed ({bullish_count}↑/{bearish_count}↓)"
+                elif bullish_count > 0:
+                    div_type = f"🟢 Bullish ({bullish_count})"
+                else:
+                    div_type = f"🔴 Bearish ({bearish_count})"
+                
+                # Show how recent the confirmation was
+                bars_ago = alert.get('confirmation_bars_ago', 0)
+                recency = "📍 JUST NOW" if bars_ago == 0 else f"📍 {bars_ago} bar{'s' if bars_ago > 1 else ''} ago"
+                
+                discord_message += f"**{alert['symbol']}** - {div_type} {recency} | ${alert['current_price']:.4f} | RSI: {alert['rsi']:.0f}\n"
+            
+            discord_message += f"\n```Requirements: ≥{MIN_DIVERGENCES} regular divergences in last 2 candles```"
+            
+            self.send_discord_alert(discord_message)
+            
+            # Option 2: Send detailed info only for top alerts
+            # Uncomment the section below to send detailed info for top 10 alerts only
+            """
+            top_alerts = alerts_sorted[:10]
+            
+            discord_message = f"**🔥 TOP DIVERGENCE ALERTS - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 🔥**\n\n"
+            discord_message += f"*Total found: {len(alerts)} | Showing top {len(top_alerts)}*\n"
+            discord_message += f"*Mode: {'Early Detection' if DONT_CONFIRM else 'Confirmed'}*\n\n"
+            
+            for alert in top_alerts:
                 discord_message += f"**{alert['symbol']}**\n"
                 discord_message += f"• Price: ${alert['current_price']:.4f} | RSI: {alert['rsi']:.2f}\n"
                 discord_message += f"• Total Divergences: {alert['total_divergences']}\n"
@@ -414,9 +679,13 @@ class BybitDivergenceScanner:
                 
                 discord_message += f"• {' | '.join(div_summary)}\n\n"
             
-            discord_message += "```Requirements met: ≥4 divergences with RSI & OBV included```"
+            if len(alerts) > 10:
+                discord_message += f"\n*... and {len(alerts) - 10} more symbols with divergences*\n"
+            
+            discord_message += f"\n```Requirements met: ≥{MIN_DIVERGENCES} divergences```"
             
             self.send_discord_alert(discord_message)
+            """
             
         else:
             print("\n\n✅ Scan complete. No alerts triggered.")
@@ -426,10 +695,38 @@ class BybitDivergenceScanner:
 if __name__ == "__main__":
     scanner = BybitDivergenceScanner()
     
+    # Calculate when to run for optimal timing
+    current_time = datetime.now()
+    minutes = current_time.minute
+    seconds = current_time.second
+    
+    # Calculate seconds until next 15-minute mark + 30 seconds buffer
+    next_15_min = ((minutes // 15) + 1) * 15
+    if next_15_min >= 60:
+        next_15_min = 0
+    
+    seconds_to_wait = ((next_15_min - minutes) * 60) - seconds + 30  # 30 second buffer after candle close
+    
+    # if seconds_to_wait > 0 and seconds_to_wait < 900:  # Don't wait more than 15 minutes
+    #     print(f"Waiting {seconds_to_wait} seconds until next 15-minute candle closes...")
+    #     time.sleep(seconds_to_wait)
+    
     # Run the scanner
     alerts = scanner.scan()
     
-    # Optionally, you can run this in a loop
+    # Optionally, you can run this in a loop synchronized with 15-minute candles
     # while True:
     #     alerts = scanner.scan()
-    #     time.sleep(900)  # Wait 15 minutes before next scan
+    #     
+    #     # Calculate time until next 15-minute mark + 30 seconds
+    #     current_time = datetime.now()
+    #     minutes = current_time.minute
+    #     seconds = current_time.second
+    #     next_15_min = ((minutes // 15) + 1) * 15
+    #     if next_15_min >= 60:
+    #         next_15_min = 0
+    #     seconds_to_wait = ((next_15_min - minutes) * 60) - seconds + 30
+    #     
+    #     if seconds_to_wait > 0:
+    #         print(f"\nNext scan in {seconds_to_wait} seconds...")
+    #         time.sleep(seconds_to_wait)
