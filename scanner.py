@@ -699,11 +699,11 @@ class BybitDivergenceScanner:
         
         alerts = []
         
-        for i, perp in enumerate(perps[:50], 1):  # Limit to top 50 by volume to avoid rate limits
+        for i, perp in enumerate(perps[:500], 1):  # Limit to top 50 by volume to avoid rate limits
             symbol = perp['symbol']
             volume = perp['volume']
             
-            print(f"\n[{i}/{min(50, len(perps))}] Analyzing {symbol} (24h Vol: ${volume:,.0f})...", end='')
+            print(f"\n[{i}/{min(500, len(perps))}] Analyzing {symbol} (24h Vol: ${volume:,.0f})...", end='')
             
             # Fetch OHLCV data
             df = self.fetch_ohlcv(symbol)
