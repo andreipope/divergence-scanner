@@ -601,7 +601,7 @@ class BybitDivergenceScanner:
             # Check if market is suitable for divergence trading
             skip_due_to_choppiness = FILTER_CHOPPY_MARKETS and market_condition['is_choppy'] and not market_condition['is_trending']
             
-            if total_divs >= MIN_DIVERGENCES and has_recent_divergence and not skip_due_to_choppiness: # and has_rsi and has_obv
+            if total_divs >= MIN_DIVERGENCES and has_recent_divergence and has_rsi: # and has_obv: #and not skip_due_to_choppiness: # and has_rsi and has_obv
                 print(f" ✅ ALERT! {total_divs} divergences found (confirmed {divergences['confirmation_info']['bars_ago']} bars ago)!")
                 
                 alert_data = {
