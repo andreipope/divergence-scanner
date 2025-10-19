@@ -201,25 +201,6 @@ class DivergenceDetector:
                 if all(highs[i] > highs[i+j] for j in range(1, self.pivot_period + 1)):
                     pivot_highs.append(i)
         
-        # Check if we might have a developing pivot at the end
-        # This allows detection similar to PineScript's real-time behavior
-        if self.dont_confirm and len(highs) > self.pivot_period:
-            # Check positions where we have enough left side but not full right side
-            for i in range(max(self.pivot_period, len(highs) - self.pivot_period), len(highs)):
-                if i >= len(highs):
-                    break
-                # Need at least pivot_period bars on the left
-                if i >= self.pivot_period:
-                    # Check left side
-                    if all(highs[i] > highs[i-j] for j in range(1, min(self.pivot_period + 1, i + 1))):
-                        # Check available right side
-                        right_bars = len(highs) - i - 1
-                        if right_bars > 0:
-                            if all(highs[i] > highs[i+j] for j in range(1, min(right_bars + 1, self.pivot_period + 1))):
-                                # Potential pivot, but need to verify it's not already in our list
-                                if i not in pivot_highs:
-                                    pivot_highs.append(i)
-        
         return sorted(pivot_highs, reverse=True)  # Most recent first
     
     def find_pivot_lows_realtime(self):
@@ -232,19 +213,6 @@ class DivergenceDetector:
             if all(lows[i] < lows[i-j] for j in range(1, self.pivot_period + 1)):
                 if all(lows[i] < lows[i+j] for j in range(1, self.pivot_period + 1)):
                     pivot_lows.append(i)
-        
-        # Check developing pivots at the end
-        if self.dont_confirm and len(lows) > self.pivot_period:
-            for i in range(max(self.pivot_period, len(lows) - self.pivot_period), len(lows)):
-                if i >= len(lows):
-                    break
-                if i >= self.pivot_period:
-                    if all(lows[i] < lows[i-j] for j in range(1, min(self.pivot_period + 1, i + 1))):
-                        right_bars = len(lows) - i - 1
-                        if right_bars > 0:
-                            if all(lows[i] < lows[i+j] for j in range(1, min(right_bars + 1, self.pivot_period + 1))):
-                                if i not in pivot_lows:
-                                    pivot_lows.append(i)
         
         return sorted(pivot_lows, reverse=True)  # Most recent first
     
@@ -276,185 +244,80 @@ class DivergenceDetector:
     
     def check_positive_regular_divergence(self, indicator, pivot_lows):
         """Check for positive regular divergence (bullish) - matching Pine Script logic"""
-        if len(pivot_lows) < 2:
+        if len(pivot_lows) < 1:
             return False, -1
         
         current_bar = len(self.df) - 1
         startpoint = 0 if self.dont_confirm else 1
+        check_idx = current_bar - startpoint
         
-        # If dont_confirm is True and indicators/price are not confirming, check from current bar
         if not self.dont_confirm:
             if not (indicator.iloc[-1] > indicator.iloc[-2] or self.df['close'].iloc[-1] > self.df['close'].iloc[-2]):
                 return False, -1
         
-        # Search through multiple pivot points (not just last 2)
         for i in range(min(self.max_pivot_points, len(pivot_lows))):
-            curr_pivot_idx = pivot_lows[i]
+            prev_pivot_idx = pivot_lows[i]
             
-            # Skip if pivot is too far from current bar
-            if current_bar - curr_pivot_idx > self.max_bars:
-                break
+            dist = check_idx - prev_pivot_idx
+            if dist <= 5 or dist > self.max_bars:
+                continue
                 
-            # Check against previous pivots
-            for j in range(i + 1, min(i + self.max_pivot_points, len(pivot_lows))):
-                prev_pivot_idx = pivot_lows[j]
-                
-                # Skip if distance is less than minimum
-                if curr_pivot_idx - prev_pivot_idx <= 5:
-                    continue
-                
-                # For recent divergences, we might check against current bar
-                check_idx = current_bar - startpoint if current_bar - curr_pivot_idx < self.pivot_period else curr_pivot_idx
-                
-                # Check divergence condition: price lower low, indicator higher low
-                price_condition = self.df['low'].iloc[check_idx] < self.df['low'].iloc[prev_pivot_idx]
-                indicator_condition = indicator.iloc[check_idx] > indicator.iloc[prev_pivot_idx]
-                
-                if price_condition and indicator_condition:
-                    # Validate intermediate values
-                    if self.validate_divergence_line(
-                        indicator, 
-                        prev_pivot_idx, 
-                        check_idx,
-                        self.df['low'].iloc[prev_pivot_idx],
-                        self.df['low'].iloc[check_idx],
-                        is_bullish=True
-                    ):
-                        # Return True and the bar index where divergence was confirmed
-                        return True, check_idx
+            # Check divergence condition: price lower low, indicator higher low
+            price_condition = self.df['low'].iloc[check_idx] < self.df['low'].iloc[prev_pivot_idx]
+            indicator_condition = indicator.iloc[check_idx] > indicator.iloc[prev_pivot_idx]
+            
+            if price_condition and indicator_condition:
+                # Validate intermediate values
+                if self.validate_divergence_line(
+                    indicator, 
+                    prev_pivot_idx, 
+                    check_idx,
+                    self.df['low'].iloc[prev_pivot_idx],
+                    self.df['low'].iloc[check_idx],
+                    is_bullish=True
+                ):
+                    # Return True and the bar index where divergence was confirmed
+                    return True, check_idx
                         
         return False, -1
     
     def check_negative_regular_divergence(self, indicator, pivot_highs):
         """Check for negative regular divergence (bearish) - matching Pine Script logic"""
-        if len(pivot_highs) < 2:
+        if len(pivot_highs) < 1:
             return False, -1
         
         current_bar = len(self.df) - 1
         startpoint = 0 if self.dont_confirm else 1
+        check_idx = current_bar - startpoint
         
-        # If dont_confirm is False, check confirmation
         if not self.dont_confirm:
             if not (indicator.iloc[-1] < indicator.iloc[-2] or self.df['close'].iloc[-1] < self.df['close'].iloc[-2]):
                 return False, -1
         
         for i in range(min(self.max_pivot_points, len(pivot_highs))):
-            curr_pivot_idx = pivot_highs[i]
+            prev_pivot_idx = pivot_highs[i]
             
-            if current_bar - curr_pivot_idx > self.max_bars:
-                break
+            dist = check_idx - prev_pivot_idx
+            if dist <= 5 or dist > self.max_bars:
+                continue
                 
-            for j in range(i + 1, min(i + self.max_pivot_points, len(pivot_highs))):
-                prev_pivot_idx = pivot_highs[j]
-                
-                if curr_pivot_idx - prev_pivot_idx <= 5:
-                    continue
-                
-                check_idx = current_bar - startpoint if current_bar - curr_pivot_idx < self.pivot_period else curr_pivot_idx
-                
-                # Check divergence condition: price higher high, indicator lower high
-                price_condition = self.df['high'].iloc[check_idx] > self.df['high'].iloc[prev_pivot_idx]
-                indicator_condition = indicator.iloc[check_idx] < indicator.iloc[prev_pivot_idx]
-                
-                if price_condition and indicator_condition:
-                    if self.validate_divergence_line(
-                        indicator,
-                        prev_pivot_idx,
-                        check_idx,
-                        self.df['high'].iloc[prev_pivot_idx],
-                        self.df['high'].iloc[check_idx],
-                        is_bullish=False
-                    ):
-                        # Return True and the bar index where divergence was confirmed
-                        return True, check_idx
+            # Check divergence condition: price higher high, indicator lower high
+            price_condition = self.df['high'].iloc[check_idx] > self.df['high'].iloc[prev_pivot_idx]
+            indicator_condition = indicator.iloc[check_idx] < indicator.iloc[prev_pivot_idx]
+            
+            if price_condition and indicator_condition:
+                if self.validate_divergence_line(
+                    indicator,
+                    prev_pivot_idx,
+                    check_idx,
+                    self.df['high'].iloc[prev_pivot_idx],
+                    self.df['high'].iloc[check_idx],
+                    is_bullish=False
+                ):
+                    # Return True and the bar index where divergence was confirmed
+                    return True, check_idx
                         
         return False, -1
-    
-    def check_positive_hidden_divergence(self, indicator, pivot_lows):
-        """Check for positive hidden divergence (bullish continuation) - matching Pine Script logic"""
-        if len(pivot_lows) < 2:
-            return False
-        
-        current_bar = len(self.df) - 1
-        startpoint = 0 if self.dont_confirm else 1
-        
-        if not self.dont_confirm:
-            if not (indicator.iloc[-1] > indicator.iloc[-2] or self.df['close'].iloc[-1] > self.df['close'].iloc[-2]):
-                return False
-        
-        for i in range(min(self.max_pivot_points, len(pivot_lows))):
-            curr_pivot_idx = pivot_lows[i]
-            
-            if current_bar - curr_pivot_idx > self.max_bars:
-                break
-                
-            for j in range(i + 1, min(i + self.max_pivot_points, len(pivot_lows))):
-                prev_pivot_idx = pivot_lows[j]
-                
-                if curr_pivot_idx - prev_pivot_idx <= 5:
-                    continue
-                
-                check_idx = current_bar - startpoint if current_bar - curr_pivot_idx < self.pivot_period else curr_pivot_idx
-                
-                # Check divergence condition: price higher low, indicator lower low
-                price_condition = self.df['low'].iloc[check_idx] > self.df['low'].iloc[prev_pivot_idx]
-                indicator_condition = indicator.iloc[check_idx] < indicator.iloc[prev_pivot_idx]
-                
-                if price_condition and indicator_condition:
-                    if self.validate_divergence_line(
-                        indicator,
-                        prev_pivot_idx,
-                        check_idx,
-                        self.df['low'].iloc[prev_pivot_idx],
-                        self.df['low'].iloc[check_idx],
-                        is_bullish=True
-                    ):
-                        return True
-                        
-        return False
-    
-    def check_negative_hidden_divergence(self, indicator, pivot_highs):
-        """Check for negative hidden divergence (bearish continuation) - matching Pine Script logic"""
-        if len(pivot_highs) < 2:
-            return False
-        
-        current_bar = len(self.df) - 1
-        startpoint = 0 if self.dont_confirm else 1
-        
-        if not self.dont_confirm:
-            if not (indicator.iloc[-1] < indicator.iloc[-2] or self.df['close'].iloc[-1] < self.df['close'].iloc[-2]):
-                return False
-        
-        for i in range(min(self.max_pivot_points, len(pivot_highs))):
-            curr_pivot_idx = pivot_highs[i]
-            
-            if current_bar - curr_pivot_idx > self.max_bars:
-                break
-                
-            for j in range(i + 1, min(i + self.max_pivot_points, len(pivot_highs))):
-                prev_pivot_idx = pivot_highs[j]
-                
-                if curr_pivot_idx - prev_pivot_idx <= 5:
-                    continue
-                
-                check_idx = current_bar - startpoint if current_bar - curr_pivot_idx < self.pivot_period else curr_pivot_idx
-                
-                # Check divergence condition: price lower high, indicator higher high
-                price_condition = self.df['high'].iloc[check_idx] < self.df['high'].iloc[prev_pivot_idx]
-                indicator_condition = indicator.iloc[check_idx] > indicator.iloc[prev_pivot_idx]
-                
-                if price_condition and indicator_condition:
-                    if self.validate_divergence_line(
-                        indicator,
-                        prev_pivot_idx,
-                        check_idx,
-                        self.df['high'].iloc[prev_pivot_idx],
-                        self.df['high'].iloc[check_idx],
-                        is_bullish=False
-                    ):
-                        return True
-                        
-        return False
 
 class BybitDivergenceScanner:
     """Main scanner class"""
