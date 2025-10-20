@@ -11,7 +11,7 @@ import sys
 warnings.filterwarnings('ignore')
 
 # Configuration
-MIN_DAILY_VOLUME = 2000000  # $5M daily volume minimum
+MIN_DAILY_VOLUME = 8000000  # $5M daily volume minimum
 PIVOT_PERIOD = 5
 MAX_BARS_TO_CHECK = 100
 MIN_DIVERGENCES = 3  # Minimum number of REGULAR divergences required
@@ -601,7 +601,7 @@ class BybitDivergenceScanner:
             # Check if market is suitable for divergence trading
             skip_due_to_choppiness = FILTER_CHOPPY_MARKETS and market_condition['is_choppy'] and not market_condition['is_trending']
             
-            if total_divs >= MIN_DIVERGENCES and has_recent_divergence and has_rsi: # and has_obv: #and not skip_due_to_choppiness: # and has_rsi and has_obv
+            if total_divs >= MIN_DIVERGENCES and has_recent_divergence and has_rsi and has_obv: #and not skip_due_to_choppiness:
                 print(f" ✅ ALERT! {total_divs} divergences found (confirmed {divergences['confirmation_info']['bars_ago']} bars ago)!")
                 
                 alert_data = {
